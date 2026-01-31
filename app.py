@@ -14,7 +14,7 @@ from find_entity_websites import find_best_website_for_entity
 # ----------------------------
 st.set_page_config(
     page_title="BardVerify Entity Website Finder",
-    page_icon="assets/logo.svg",
+    page_icon="assets/favicon.ico",
     layout="wide"
 )
 
