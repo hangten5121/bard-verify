@@ -46,6 +46,14 @@ def get_secret(key: str, default: str = "") -> str:
     Loads secrets from Streamlit Cloud secrets manager if available,
     otherwise falls back to environment variables.
     """
+import pandas as pd
+import streamlit as st
+
+# ----------------------------
+# Load Google API keys safely - Supports Streamlit secrets and env vars
+# ----------------------------
+
+def get_secret(key: str, default: str = ""):
     try:
         return st.secrets.get(key, os.getenv(key, default))
     except Exception:

@@ -3,8 +3,8 @@
 find_entity_websites.py
 
 Reads a CSV with at least:
-- entity_name (configurable)
-- mailing_state (configurable)
+- entity_name
+- area_code (or something similar; configurable)
 
 For each entity_name:
 1) Uses Google Custom Search JSON API to find likely official website domains.
@@ -13,11 +13,7 @@ For each entity_name:
 4) Writes:
    - master_results.csv
    - one CSV per mailing_state in ./by_mailing_state/
-
 Usage:
-  python find_entity_websites.py \
-    --input business_data.csv \
-    --name-col entity_name \
     --state-col mailing_state \
     --out master_results.csv \
     --google-api-key "$GOOGLE_API_KEY" \
