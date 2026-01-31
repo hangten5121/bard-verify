@@ -3,8 +3,8 @@
 find_entity_websites.py
 
 Reads a CSV with at least:
-- entity_name
-- area_code (or something similar; configurable)
+- entity_name (configurable)
+- mailing_state (configurable)
 
 For each entity_name:
 1) Uses Google Custom Search JSON API to find likely official website domains.
@@ -12,13 +12,13 @@ For each entity_name:
 3) Verifies candidate websites via HTTP (requests), with timeouts.
 4) Writes:
    - master_results.csv
-   - one CSV per area code in ./by_area_code/
+   - one CSV per mailing_state in ./by_mailing_state/
 
 Usage:
   python find_entity_websites.py \
     --input business_data.csv \
     --name-col entity_name \
-    --area-col area_code \
+    --state-col mailing_state \
     --out master_results.csv \
     --google-api-key "$GOOGLE_API_KEY" \
     --google-cx "$GOOGLE_CX"
@@ -31,11 +31,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
 import time
-import json
-import math
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -63,14 +62,14 @@ COMMON_NON_OFFICIAL_HOSTS = {
     "google.com",
 }
 
-USER_AGENT = "Mozilla/5.0 (compatible; EntityWebsiteFinder/1.0; +https://example.com/bot)"
+USER_AGENT = "Mozilla/5.0 (compatible; BardVerify/1.0; +internal-tool)"
 
 
 def normalize_name_to_domain_base(name: str) -> str:
     """
     Turn 'Acme Plumbing, LLC' into 'acmeplumbing' (a naive base for guessing domains).
     """
-    name = name.lower().strip()
+    name = (name or "").lower().strip()
 
     # Drop common legal suffixes and noise words
     suffixes = [
@@ -86,12 +85,10 @@ def normalize_name_to_domain_base(name: str) -> str:
     # Remove all non-alphanumerics
     name = re.sub(r"[^a-z0-9]+", "", name)
 
-    # Collapse
-    name = re.sub(r"\s+", "", name).strip()
-    return name
+    return name.strip()
 
 
-def extract_registered_domain(url: str) -> Optional[str]:
+def extract_domain(url: str) -> Optional[str]:
     """
     Extract host from URL and reduce to host; keep full host here (no publicsuffix parsing).
     """
@@ -99,7 +96,6 @@ def extract_registered_domain(url: str) -> Optional[str]:
         host = urlparse(url).netloc.lower()
         if not host:
             return None
-        # strip leading www.
         if host.startswith("www."):
             host = host[4:]
         return host
@@ -117,9 +113,8 @@ def looks_like_valid_website(url: str, timeout: float = 8.0) -> Tuple[bool, Opti
     """
     headers = {"User-Agent": USER_AGENT}
     try:
-        # Some sites block HEAD; start with GET if you prefer.
         r = requests.head(url, allow_redirects=True, timeout=timeout, headers=headers)
-        if r.status_code >= 400 or r.status_code == 405:
+        if r.status_code >= 400 or r.status_code in (405, 403):
             r = requests.get(url, allow_redirects=True, timeout=timeout, headers=headers)
         live = 200 <= r.status_code < 400
         return live, r.status_code, r.url
@@ -162,7 +157,7 @@ def candidate_domains_from_search_items(items: List[Dict]) -> List[str]:
         link = it.get("link")
         if not link:
             continue
-        host = extract_registered_domain(link)
+        host = extract_domain(link)
         if not host:
             continue
         if host in COMMON_NON_OFFICIAL_HOSTS:
@@ -171,7 +166,7 @@ def candidate_domains_from_search_items(items: List[Dict]) -> List[str]:
 
     # de-dupe preserving order
     seen = set()
-    out = []
+    out: List[str] = []
     for d in domains:
         if d not in seen:
             seen.add(d)
@@ -185,33 +180,31 @@ def candidate_domains_from_search_items(items: List[Dict]) -> List[str]:
 
 @dataclass
 class ResultRow:
-    area_code: str
+    mailing_state: str
     entity_name: str
     search_query: str
     best_domain: str
     best_url: str
     best_http_status: str
     method: str  # "google" or "guess" or "none"
-    other_candidates: str  # JSON list for traceability
+    other_candidates: str  # JSON for traceability
 
 
 def find_best_website_for_entity(
     entity_name: str,
-    area_code: str,
+    mailing_state: str,
     google_api_key: Optional[str],
     google_cx: Optional[str],
     try_tlds: Iterable[str] = ("com", "org", "net"),
     timeout: float = 8.0,
 ) -> ResultRow:
-    # Build a query that includes area code as a weak location hint.
-    # If you have city/state fields, it’s even better to use those instead.
-    query = f'"{entity_name}" website {area_code}'.strip()
+    # Build a query that includes mailing_state as a location hint.
+    query = f'"{entity_name}" official website {mailing_state}'.strip()
 
     candidates: List[Tuple[str, str]] = []  # (method, candidate_url)
-
-    # 1) Google search candidates
     other_candidates_struct = {"google_domains": [], "guessed_urls": []}
 
+    # 1) Google search candidates
     if google_api_key and google_cx:
         try:
             items = google_custom_search(query, api_key=google_api_key, cx=google_cx, num=5)
@@ -219,11 +212,9 @@ def find_best_website_for_entity(
             other_candidates_struct["google_domains"] = domains
 
             for d in domains:
-                # test https then http
                 candidates.append(("google", f"https://{d}/"))
                 candidates.append(("google", f"http://{d}/"))
         except Exception:
-            # If search fails, continue with guessing
             pass
 
     # 2) Heuristic guesses
@@ -235,25 +226,24 @@ def find_best_website_for_entity(
             candidates.append(("guess", f"https://{guessed}/"))
             candidates.append(("guess", f"http://{guessed}/"))
 
-    # Evaluate candidates in order; first live wins
-    checked = []
+    # 3) Validate candidates in order; first live wins
     for method, url in candidates:
         live, status, final_url = looks_like_valid_website(url, timeout=timeout)
-        checked.append({"method": method, "url": url, "live": live, "status": status, "final": final_url})
         if live:
             return ResultRow(
-                area_code=str(area_code or ""),
+                mailing_state=str(mailing_state or ""),
                 entity_name=entity_name,
                 search_query=query,
-                best_domain=extract_registered_domain(final_url or url) or "",
+                best_domain=extract_domain(final_url or url) or "",
                 best_url=final_url or url,
                 best_http_status=str(status) if status is not None else "",
                 method=method,
                 other_candidates=json.dumps(other_candidates_struct, ensure_ascii=False),
             )
 
+    # 4) Nothing found
     return ResultRow(
-        area_code=str(area_code or ""),
+        mailing_state=str(mailing_state or ""),
         entity_name=entity_name,
         search_query=query,
         best_domain="",
@@ -270,7 +260,7 @@ def write_csv(path: str, rows: List[ResultRow]) -> None:
         w = csv.DictWriter(
             f,
             fieldnames=[
-                "area_code",
+                "mailing_state",
                 "entity_name",
                 "search_query",
                 "best_domain",
@@ -283,7 +273,7 @@ def write_csv(path: str, rows: List[ResultRow]) -> None:
         w.writeheader()
         for r in rows:
             w.writerow({
-                "area_code": r.area_code,
+                "mailing_state": r.mailing_state,
                 "entity_name": r.entity_name,
                 "search_query": r.search_query,
                 "best_domain": r.best_domain,
@@ -299,7 +289,7 @@ def main() -> int:
     ap.add_argument("--input", required=True, help="Input CSV path")
     ap.add_argument("--out", default="master_results.csv", help="Master output CSV")
     ap.add_argument("--name-col", default="entity_name", help="Column name for entity name")
-    ap.add_argument("--area-col", default="area_code", help="Column name for area code")
+    ap.add_argument("--state-col", default="mailing_state", help="Column name for mailing state")
     ap.add_argument("--google-api-key", default=os.getenv("GOOGLE_API_KEY"), help="Google API key")
     ap.add_argument("--google-cx", default=os.getenv("GOOGLE_CX"), help="Google Custom Search Engine ID (cx)")
     ap.add_argument("--limit", type=int, default=0, help="Limit number of rows (0 = no limit)")
@@ -311,34 +301,36 @@ def main() -> int:
     google_cx = args.google_cx
 
     rows_out: List[ResultRow] = []
-    by_area: Dict[str, List[ResultRow]] = {}
+    by_state: Dict[str, List[ResultRow]] = {}
 
     with open(args.input, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise SystemExit("Input CSV has no header row.")
         if args.name_col not in reader.fieldnames:
             raise SystemExit(f"Missing required column: {args.name_col}. Found: {reader.fieldnames}")
-        if args.area_col not in reader.fieldnames:
-            raise SystemExit(f"Missing required column: {args.area_col}. Found: {reader.fieldnames}")
+        if args.state_col not in reader.fieldnames:
+            raise SystemExit(f"Missing required column: {args.state_col}. Found: {reader.fieldnames}")
 
         for i, row in enumerate(reader, start=1):
             if args.limit and i > args.limit:
                 break
 
             name = (row.get(args.name_col) or "").strip()
-            area = (row.get(args.area_col) or "").strip()
+            state = (row.get(args.state_col) or "").strip() or "UNKNOWN"
 
             if not name:
                 continue
 
             res = find_best_website_for_entity(
                 entity_name=name,
-                area_code=area,
+                mailing_state=state,
                 google_api_key=google_api_key,
                 google_cx=google_cx,
                 timeout=args.timeout,
             )
             rows_out.append(res)
-            by_area.setdefault(res.area_code or "UNKNOWN", []).append(res)
+            by_state.setdefault(res.mailing_state or "UNKNOWN", []).append(res)
 
             # Be polite to APIs
             if google_api_key and google_cx:
@@ -350,14 +342,14 @@ def main() -> int:
     # Write master CSV
     write_csv(args.out, rows_out)
 
-    # Write per-area-code CSVs
-    out_dir = "by_area_code"
+    # Write per-mailing-state CSVs
+    out_dir = "by_mailing_state"
     os.makedirs(out_dir, exist_ok=True)
-    for area_code, items in by_area.items():
-        safe_area = re.sub(r"[^0-9A-Za-z_-]+", "_", area_code or "UNKNOWN")
-        write_csv(os.path.join(out_dir, f"results_area_{safe_area}.csv"), items)
+    for mailing_state, items in by_state.items():
+        safe_state = re.sub(r"[^0-9A-Za-z_-]+", "_", mailing_state or "UNKNOWN")
+        write_csv(os.path.join(out_dir, f"results_state_{safe_state}.csv"), items)
 
-    print(f"Done. Wrote master: {args.out} and per-area files in ./{out_dir}/")
+    print(f"Done. Wrote master: {args.out} and per-state files in ./{out_dir}/")
     return 0
 
 
